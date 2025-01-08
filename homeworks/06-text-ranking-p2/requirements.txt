@@ -5,3 +5,4 @@ tqdm~=4.66.5
 pandas~=2.2.3
 nltk~=3.9.1
 numba~=0.60.0
+scikit-learn~=1.5.2

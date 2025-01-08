@@ -3,45 +3,23 @@
 """Text ranking homework solution"""
 
 import argparse
+import csv
+import sys
 from timeit import default_timer as timer
-from typing import Iterable
 
-import pandas as pd
 import numpy as np
-from collections import Counter
-from nltk.tokenize import WordPunctTokenizer
-from tqdm.notebook import tqdm
+import pandas as pd
 from numba import njit
+from sklearn.feature_extraction.text import TfidfVectorizer
+from tqdm import tqdm
 
-# Constants
-CHUNK_SIZE = 10000
-K1 = 2.0
-B = 0.75
-
-# Tokenizer
-TOKENIZER = WordPunctTokenizer()
+csv.field_size_limit(sys.maxsize)
 
 
-@njit
-def calculate_idf(total_documents: int, document_frequency: int) -> float:
-    return np.log((total_documents - document_frequency + 0.5) / (document_frequency + 0.5)) + 1
-
-
-def load_datasets(data_dir: str) -> tuple[Iterable[pd.DataFrame], pd.DataFrame]:
-    document_chunks = pd.read_csv(
-        f"{data_dir}/vkmarco-docs.tsv",
-        sep='\t',
-        header=None,
-        names=["DocumentId", "URL", "TitleText", "BodyText"],
-        chunksize=CHUNK_SIZE,
-        engine='c'
-    )
-
+def get_submission_data_and_relevant_doc_ids(data_dir: str) -> tuple[pd.DataFrame, set[str]]:
     submission_data = pd.read_csv(
         f"{data_dir}/sample_submission.csv",
-        sep=',',
         header="infer",
-        engine='c'
     )
 
     queries_data = pd.read_csv(
@@ -49,78 +27,93 @@ def load_datasets(data_dir: str) -> tuple[Iterable[pd.DataFrame], pd.DataFrame]:
         sep='\t',
         header=None,
         names=["QueryId", "QueryText"],
-        engine='c'
     )
 
     submission_data = submission_data.merge(queries_data, how="left", on="QueryId")
-    return document_chunks, submission_data
+    relevant_document_ids = set(submission_data["DocumentId"].unique())
+
+    return submission_data, relevant_document_ids
 
 
-def extract_relevant_documents(document_chunks: Iterable[pd.DataFrame], relevant_document_ids: set) -> list[dict]:
-    relevant_documents = []
-    for chunk in tqdm(document_chunks):
-        for row in chunk.itertuples():
-            if row.DocumentId in relevant_document_ids:
-                document_text = ' '.join([str(row.TitleText), str(row.BodyText)]) if row.TitleText else str(
-                    row.BodyText)
-                relevant_documents.append({"DocumentId": row.DocumentId, "text": document_text})
-    return relevant_documents
+def get_relevant_documents(data_dir: str, relevant_document_ids: set[str]) -> pd.DataFrame:
+    relevant_documents_list = []
+
+    with open(f"{data_dir}/vkmarco-docs.tsv", 'r', encoding='utf-8') as doc_file:
+        document_reader = csv.reader(doc_file, delimiter='\t')
+        for row in tqdm(document_reader):
+            if row[0] in relevant_document_ids:
+                full_text = f"{row[2]} {row[3]}"
+                relevant_documents_list.append({"DocumentId": row[0], "DocumentText": full_text})
+
+    return pd.DataFrame(relevant_documents_list)
 
 
-def compute_bm25_scores(document_lengths: list[int], average_document_length: float, term_frequencies: list[Counter],
-                        idf_values: dict, query_texts: pd.Series) -> np.ndarray:
-    scores = np.zeros(len(document_lengths))
-    for i in range(len(document_lengths)):
-        query_terms = TOKENIZER.tokenize(str(query_texts.iloc[i]))
-        document_length = document_lengths[i]
-        score = 0.0
-        for term in query_terms:
-            if term in term_frequencies[i]:
-                term_frequency = term_frequencies[i][term]
-                idf = idf_values.get(term, 0.0)
-                score += idf * (term_frequency * (K1 + 1)) / (
-                            term_frequency + K1 * (1 - B + B * document_length / average_document_length))
-        scores[i] = score
-    return scores
-
-
-def process_documents_and_queries(documents: pd.Series, queries: pd.Series, batch_size: int = 1000) -> list[float]:
-    document_lengths = []
-    document_term_frequencies = []
-    global_term_frequencies = Counter()
-
-    for document in tqdm(documents):
-        tokens = TOKENIZER.tokenize(str(document).lower())
-        document_lengths.append(len(tokens))
-        term_frequency = Counter(tokens)
-        document_term_frequencies.append(term_frequency)
-        global_term_frequencies.update(term_frequency.keys())
-
-    average_document_length = np.mean(document_lengths)
-    total_documents = len(document_lengths)
-
-    idf_values = {term: calculate_idf(total_documents, global_term_frequencies[term]) for term in
-                  global_term_frequencies}
-
+@njit
+def get_query_docs_bm25_scores(
+        doc_ids: list,
+        tfidf_matrix: np.ndarray,
+        idf: np.ndarray,
+        query_vector: np.ndarray,
+        doc_lengths: np.ndarray,
+        avgdl: float,
+        k1: float = 1.5,
+        b: float = 0.75,
+) -> list[tuple[str, float]]:
     scores = []
-    for start in tqdm(range(0, total_documents, batch_size)):
-        end = min(start + batch_size, total_documents)
-        batch_scores = compute_bm25_scores(
-            document_lengths[start:end],
-            average_document_length,
-            document_term_frequencies[start:end],
-            idf_values,
-            queries[start:end]
-        )
-        scores.extend(batch_scores)
+    for i, doc_id in enumerate(doc_ids):
+        doc_vector = tfidf_matrix[i]
+
+        score = 0
+        for term_idx, term_idf in enumerate(idf):
+            term_frequency = doc_vector[term_idx]
+            query_term_frequency = query_vector[term_idx]
+
+            if query_term_frequency > 0:
+                numerator = term_frequency * (k1 + 1)
+                denominator = term_frequency + k1 * (1 - b + b * (doc_lengths[i] / avgdl))
+                score += term_idf * (numerator / denominator)
+
+        scores.append((doc_id, score))
 
     return scores
 
 
-def save_submission_file(results_df: pd.DataFrame, output_file: str) -> None:
-    submission_df = results_df[["QueryId", "DocumentId"]]
-    submission_df.reset_index(inplace=True, drop=True)
-    submission_df.to_csv(output_file, index=False)
+def rank_documents(need_to_rank_df) -> pd.DataFrame:
+    grouped = need_to_rank_df.groupby("QueryId")
+
+    ranked_df = []
+
+    for query_id, group in tqdm(grouped):
+        query_text = group.iloc[0]["QueryText"]
+        documents = group["DocumentText"].tolist()
+        doc_ids = group["DocumentId"].tolist()
+
+        vectorizer = TfidfVectorizer(norm=None, smooth_idf=False)
+        tfidf_matrix = vectorizer.fit_transform(documents).toarray()
+        idf = vectorizer.idf_
+
+        doc_lengths = np.array(tfidf_matrix.sum(axis=1)).flatten()
+        avgdl = np.mean(doc_lengths)
+
+        query_vector = vectorizer.transform([query_text]).toarray().flatten()
+
+        scores = get_query_docs_bm25_scores(
+            doc_ids,
+            tfidf_matrix,
+            idf,
+            query_vector,
+            doc_lengths,
+            avgdl,
+        )
+        scores.sort(key=lambda x: x[1], reverse=True)
+
+        for doc_id, _ in scores:
+            ranked_df.append({
+                "QueryId": query_id,
+                "DocumentId": doc_id,
+            })
+
+    return pd.DataFrame(ranked_df)
 
 
 def main():
@@ -131,18 +124,13 @@ def main():
 
     start_time = timer()
 
-    document_chunks, submission_data = load_datasets(args.data_dir)
+    submission_data, relevant_document_ids = get_submission_data_and_relevant_doc_ids(args.data_dir)
 
-    relevant_document_ids = set(submission_data["DocumentId"].unique())
-    relevant_documents = extract_relevant_documents(document_chunks, relevant_document_ids)
+    relevant_documents = get_relevant_documents(args.data_dir, relevant_document_ids)
+    need_to_rank_df = submission_data.merge(relevant_documents, on="DocumentId", how="left")
 
-    results_df = pd.DataFrame(relevant_documents).merge(submission_data, how="right", on="DocumentId")
-
-    bm25_scores = process_documents_and_queries(results_df['text'], results_df['QueryText'])
-    results_df["BM25Score"] = bm25_scores
-
-    results_df = results_df.sort_values(by=['QueryId', "BM25Score"], ascending=[True, False])
-    save_submission_file(results_df, args.submission_file)
+    result_df = rank_documents(need_to_rank_df)
+    result_df.to_csv(args.submission_file, index=False)
 
     elapsed_time = timer() - start_time
     print(f"Finished processing in {elapsed_time:.3f} seconds")
